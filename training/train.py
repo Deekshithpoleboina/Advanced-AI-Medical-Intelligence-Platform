@@ -1,57 +1,85 @@
-import streamlit as st
-import requests
-import pandas as pd
-from PIL import Image
+import os
+import json
+import copy
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader
 
-st.set_page_config(page_title="AI Medical Platform", layout="wide")
-st.title("🩺 Advanced AI Medical Intelligence Platform")
-st.warning("AI-assisted output only. Not a medical diagnosis.")
+DATA_DIR = os.getenv("DATA_DIR", "dataset/chest_xray")
+BATCH_SIZE = 16
+EPOCHS = 5
+LR = 1e-4
 
-api = st.sidebar.text_input("FastAPI URL", "http://127.0.0.1:8000")
-page = st.sidebar.radio("Menu", ["Predict", "History", "About"])
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.makedirs("artifacts", exist_ok=True)
 
-if page == "Predict":
-    uploaded = st.file_uploader("Upload Chest X-ray", type=["jpg", "jpeg", "png"])
-    if uploaded:
-        img = Image.open(uploaded)
-        st.image(img, caption="Uploaded Image", width=350)
+train_tf = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
 
-        if st.button("Analyze Image"):
-            files = {"file": (uploaded.name, uploaded.getvalue(), uploaded.type)}
-            r = requests.post(f"{api}/predict", files=files, timeout=180)
-            if r.status_code != 200:
-                st.error(r.text)
-            else:
-                data = r.json()
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.subheader("Prediction")
-                    st.success(data["prediction"])
-                    st.metric("Confidence", f"{data['confidence']*100:.2f}%")
-                    st.metric("Latency", f"{data['latency_ms']:.2f} ms")
-                with c2:
-                    st.subheader("Grad-CAM")
-                    st.image(f"{api}{data['gradcam']}", use_column_width=True)
+val_tf = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
 
-                st.subheader("AI Medical Report")
-                st.write(data["report"])
+train_ds = datasets.ImageFolder(os.path.join(DATA_DIR, "train"), transform=train_tf)
+val_ds = datasets.ImageFolder(os.path.join(DATA_DIR, "val"), transform=val_tf)
 
-elif page == "History":
-    st.subheader("Prediction History")
-    limit = st.slider("Rows", 5, 100, 20, 5)
-    if st.button("Load History"):
-        r = requests.get(f"{api}/history?limit={limit}", timeout=60)
-        if r.status_code == 200:
-            rows = r.json()
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-        else:
-            st.error(r.text)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
 
-else:
-    st.markdown("""
-### About
-- DenseNet121 chest X-ray classification
-- Grad-CAM explainability
-- Gemini AI report generation
-- FastAPI + SQLite + Streamlit
-""")
+class_names = train_ds.classes
+with open("artifacts/class_names.json", "w") as f:
+    json.dump(class_names, f)
+
+model = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
+model.classifier = nn.Linear(model.classifier.in_features, len(class_names))
+model.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=LR)
+
+best_acc = 0.0
+best_w = copy.deepcopy(model.state_dict())
+
+for epoch in range(EPOCHS):
+    model.train()
+    tr_correct = tr_total = 0
+
+    for x, y in train_loader:
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        out = model(x)
+        loss = criterion(out, y)
+        loss.backward()
+        optimizer.step()
+        tr_correct += (out.argmax(1) == y).sum().item()
+        tr_total += y.size(0)
+
+    model.eval()
+    va_correct = va_total = 0
+    with torch.no_grad():
+        for x, y in val_loader:
+            x, y = x.to(device), y.to(device)
+            out = model(x)
+            va_correct += (out.argmax(1) == y).sum().item()
+            va_total += y.size(0)
+
+    tr_acc = tr_correct / tr_total
+    va_acc = va_correct / va_total
+    print(f"Epoch {epoch+1}/{EPOCHS} train_acc={tr_acc:.4f} val_acc={va_acc:.4f}")
+
+    if va_acc > best_acc:
+        best_acc = va_acc
+        best_w = copy.deepcopy(model.state_dict())
+
+model.load_state_dict(best_w)
+torch.save(model.state_dict(), "artifacts/best_model.pth")
+print("Saved model to artifacts/best_model.pth")
+print("Best val accuracy:", best_acc)
